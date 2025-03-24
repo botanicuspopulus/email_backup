@@ -14,12 +14,13 @@ from tqdm import tqdm
 
 from MailProcessor import MailProcessor
 
+LOG_LEVELS = {
+    0: logging.WARNING,
+    1: logging.INFO,
+    2: logging.DEBUG,
+}
 
 load_dotenv()
-
-logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
-)
 
 async def shutdown(signal, loop) -> None:
     logging.info("Received exit signal %s... Cancelling tasks", signal.name)
@@ -82,6 +83,7 @@ async def multiprocess_main(server: str, username: str, password: str, save_path
         logging.info("Processed mailboxes: %s", results)
 
 async def async_main(server: str, username: str, password: str, save_path: Path, search: str):
+    logging.info("Starting async main with server: %s", server)
     loop = asyncio.get_running_loop()
     for s in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(s, lambda s=s: asyncio.create_task(shutdown(s, loop)))
@@ -120,10 +122,20 @@ async def async_main(server: str, username: str, password: str, save_path: Path,
     default=lambda: os.getenv("IMAP_SAVE_PATH", "./email"),
     help="The base directory ro save emails and attachments.",
 )
-def main(server: str, username: str, password: str, search: str, save_path:Path):
+@click.option(
+    "-v", "--verbose",
+    count=True, 
+    help="Increase the verbosity of the logging output. (-v for infor, -vv for debug)"
+)
+def main(server: str, username: str, password: str, search: str, save_path: str, verbose: int):
+    logging_level = LOG_LEVELS.get(verbose, logging.WARNING)
+    logging.basicConfig(
+        level=logging_level, format="%(asctime)s - %(levelname)s - %(message)s"
+    )
+
     try:
         path = Path(save_path)
-        asyncio.run(multiprocess_main(server, username, password, path, search))
+        asyncio.run(async_main(server, username, password, path, search))
     except KeyboardInterrupt:
         logging.info("Keyboard interrupt received. Exiting")
 

@@ -45,18 +45,18 @@ class MailProcessor:
         response = await self.connection.login(self.username, self.password)
 
         if response.result != "OK":
-            logging.error("Login Failed")
+            logging.error("Connection to %s Failed", self.server)
         else:
-            logging.info("Connection Successful")
+            logging.info("Connection to %s was Successful", self.server)
 
     async def disconnect(self):
         if self.connection:
             await self.connection.logout()
-            logging.info("Logged out from IMAP Server")
+            logging.info("Logged out from IMAP Server %s", self.server)
 
     async def retrieve_mailboxes(self):
         if not self.connection:
-            logging.error("No connection to mail server")
+            logging.error("No connection to mail server %s", self.server)
             return
 
         status, mailboxes = await self.connection.list('""', "*")
@@ -67,29 +67,35 @@ class MailProcessor:
         self.mailboxes = list(
             filter(None, (extract_mailbox_name(mailbox) for mailbox in mailboxes))
         )
+        logging.debug("Retrieved %d mailboxes: %s", len(self.mailboxes), self.mailboxes)
 
     async def process_all_mailboxes(self, search_criteria: str = "ALL"):
         if not self.mailboxes:
-            logging.error("There are no mailboxes to process")
+            logging.error("There are no mailboxes to process for %s", self.server)
             return
+            
+        pbar = tqdm(total=len(self.mailboxes))
+        async def wrapped(mailbox: str):
+            pbar.set_description(f"Processing mailbox {mailbox}")
+            result = await self.process_mailbox(mailbox, search_criteria)
+            pbar.update(1)
+            return result
 
-        mailbox_tasks = []
-        for mailbox in self.mailboxes:
-            mailbox_tasks.append(
-                asyncio.create_task(self.process_mailbox(mailbox, search_criteria))
-            )
+        mailbox_tasks = [wrapped(mailbox) for mailbox in self.mailboxes]
 
-        if mailbox_tasks:
-            pbar = tqdm(total=len(mailbox_tasks), desc="Processing all mailboxes")
-            for task in asyncio.as_completed(mailbox_tasks):
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    logging.info("Mailbox processing task cancelled")
-                    raise
+        if not mailbox_tasks:
+            logging.info("No mail matching %s found", search_criteria)
+            return
+            
+        for task in asyncio.as_completed(mailbox_tasks):
+            try:
+                await task
+            except asyncio.CancelledError:
+                logging.info("Mailbox processing task cancelled")
+                raise
 
-                pbar.update(1)
-            pbar.close()
+            pbar.update(1)
+        pbar.close()
 
     async def batch_fetch_emails(
         self, connection, search_criteria: str = "ALL"):
@@ -122,7 +128,7 @@ class MailProcessor:
                 raw_email = items[1]
                 yield mid, raw_email
 
-    async def _process_email_tasks(self, tasks, mailbox_name):
+    async def _process_email_tasks(self, tasks: list[asyncio.Task], mailbox_name: str):
         if not tasks:
             return
 
@@ -131,7 +137,7 @@ class MailProcessor:
             try:
                 await task
             except asyncio.CancelledError:
-                logging.info("Email processing task cancelled")
+                logging.info("Email processing task cancelled for %s", mailbox_name)
                 raise
 
             pbar.update(1)
