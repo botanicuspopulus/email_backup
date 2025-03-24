@@ -10,6 +10,7 @@ import aiofiles
 import html2text
 
 from docling.document_converter import DocumentConverter
+from docling.datamodel.base_models import InputFormat
 
 def sanitize_filename(filename: str) -> str:
     return re.sub(r'[\\/*?:"<>|]', "_", filename)
@@ -56,24 +57,43 @@ class EmailHandler:
         async with aiofiles.open(email_file_path, "wb") as f:
             await f.write(self.raw_email)
 
+    async def process_pdf(self, filepath: Path, data: bytes):
+        await self._async_write_file(filepath, data)
+        converter = DocumentConverter(allowed_formats=[
+            InputFormat.PDF
+        ])
+        result = await asyncio.to_thread(converter.convert, filepath)
+        async with aiofiles.open(filepath.with_suffix(".md"), "w") as f:
+            await f.write(result.document.export_to_markdown())
+
     async def save_attachments(self):
         tasks = []
         for part in self.msg.iter_attachments():
             attachment_filename = part.get_filename()
-            if attachment_filename:
-                attachment_path = self.folder_path / sanitize_filename(
-                    attachment_filename
-                )
-                if attachment_path.exists():
-                    continue
+            if not attachment_filename:
+                continue
 
-                payload = part.get_payload(decode=True)
-                if payload:
-                    tasks.append(
-                        asyncio.create_task(
-                            self._async_write_file(attachment_path, payload)
-                        )
+            attachment_path = self.folder_path / sanitize_filename(
+                attachment_filename
+            )
+            if attachment_path.exists():
+                continue
+
+            payload = part.get_payload(decode=True)
+            if not payload:
+                continue
+
+            if attachment_path.suffix == ".pdf":
+                tasks.append(asyncio.create_task(
+                    self.process_pdf(attachment_path, payload))
+                )
+            else:
+                tasks.append(
+                    asyncio.create_task(
+                        self._async_write_file(attachment_path, payload)
                     )
+                )
+
         if tasks:
             await asyncio.gather(*tasks)
 

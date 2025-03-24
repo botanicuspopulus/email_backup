@@ -8,6 +8,7 @@ from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor
 
 import click
+import docling
 from dotenv import load_dotenv
 from tqdm import tqdm
 
@@ -43,7 +44,6 @@ def zip_all_subdirectories(source_dir: str, zip_name: str):
     with zipfile.ZipFile(zip_name, "w", zipfile.ZIP_DEFLATED) as zipf:
         for file in tqdm(files_to_zip, desc="Zipping files"):
             zipf.write(file, file.relative_to(source_path))
-
 
 def process_mailbox(mailbox: str, server:str, username: str, password: str, save_path: Path, search: str):
     async def run():
@@ -117,12 +117,13 @@ async def async_main(server: str, username: str, password: str, save_path: Path,
 @click.option("--search", default="ALL", help="The search criteria for the emails.")
 @click.option(
     "--save-path",
-    default=lambda: Path(os.getenv("IMAP_SAVE_PATH", "./email")),
+    default=lambda: os.getenv("IMAP_SAVE_PATH", "./email"),
     help="The base directory ro save emails and attachments.",
 )
 def main(server: str, username: str, password: str, search: str, save_path:Path):
     try:
-        asyncio.run(multiprocess_main(server, username, password, save_path, search))
+        path = Path(save_path)
+        asyncio.run(multiprocess_main(server, username, password, path, search))
     except KeyboardInterrupt:
         logging.info("Keyboard interrupt received. Exiting")
 
