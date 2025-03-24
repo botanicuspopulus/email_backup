@@ -1,6 +1,7 @@
 import asyncio
 import re
 import email
+import logging
 from pathlib import Path
 from email import policy
 from email.header import decode_header
@@ -62,10 +63,14 @@ class EmailHandler:
         converter = DocumentConverter(allowed_formats=[
             InputFormat.PDF
         ])
-        result = await asyncio.to_thread(converter.convert, filepath)
-        async with aiofiles.open(filepath.with_suffix(".md"), "w") as f:
-            await f.write(result.document.export_to_markdown())
-
+        
+        try:
+            result = await asyncio.to_thread(converter.convert, filepath)
+            async with aiofiles.open(filepath.with_suffix(".md"), "w") as f:
+                await f.write(result.document.export_to_markdown())
+        except Exception as e:
+            logging.error("Error performing OCR on PDF %s: %s", filepath, e)
+            
     async def save_attachments(self):
         tasks = []
         for part in self.msg.iter_attachments():
