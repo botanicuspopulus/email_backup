@@ -1,7 +1,6 @@
 import asyncio
 import re
 import email
-import logging
 from pathlib import Path
 from email import policy
 from email.header import decode_header
@@ -9,6 +8,8 @@ from functools import lru_cache
 
 import aiofiles
 import html2text
+
+from docling.document_converter import DocumentConverter
 
 def sanitize_filename(filename: str) -> str:
     return re.sub(r'[\\/*?:"<>|]', "_", filename)
@@ -35,7 +36,16 @@ class EmailHandler:
 
         date = self.msg.get("Date", "no_date")
         if date != "no_date":
-            date = email.utils.parsedate_to_datetime(date).strftime("%Y-%m-%d")
+            try:
+                date = email.utils.parsedate_to_datetime(date).strftime("%Y-%m-%d")
+            except ValueError:
+                from datetime import datetime
+                try:
+                    date = datetime.strptime(date, "%d-%m-%Y %H:%M:%S").strftime(
+                        "%Y-%m-%d"
+                    )
+                except ValueError:
+                    date = "no_date"
 
         folder_path = self.base_path / f"{date}-{self.msg_id}"
         folder_path.mkdir(parents=True, exist_ok=True)
@@ -72,7 +82,7 @@ class EmailHandler:
             await f.write(data)
 
     async def save_markdown(self):
-        metadata_fields = ["From", "To", "CC", "BCC", "Subject", "Date"]
+        metadata_fields = ("From", "To", "CC", "BCC", "Subject", "Date")
         md = "| Field | Value |\n| --- | --- |\n"
         for field in metadata_fields:
             value = decode_header_value(self.msg.get(field, ""))

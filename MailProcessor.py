@@ -30,7 +30,6 @@ def extract_mailbox_name(line: bytes) -> str | None:
 
 
 class MailProcessor:
-
     def __init__(self, server: str, username: str, password: str, base_path: Path):
         self.server = server
         self.username = username
@@ -38,6 +37,7 @@ class MailProcessor:
         self.base_path = base_path
         self.connection = None
         self.mailboxes = None
+        self.batch_size = int(os.environ.get("BATCH_SIZE", 50))
 
     async def connect(self):
         self.connection = aioimaplib.IMAP4_SSL(self.server)
@@ -92,8 +92,7 @@ class MailProcessor:
             pbar.close()
 
     async def batch_fetch_emails(
-        self, connection, search_criteria: str = "ALL", batch_size: int = 50
-    ):
+        self, connection, search_criteria: str = "ALL"):
         criteria_args = search_criteria.split()
         response = await connection.search(*criteria_args)
         if response.result != "OK":
@@ -107,6 +106,7 @@ class MailProcessor:
         message_numbers = response.lines[0]
 
         msg_ids = message_numbers.split()
+        batch_size = self.batch_size
         for i in tqdm(
             range(0, len(msg_ids), batch_size), desc="Fetching batch of emails"
         ):
@@ -156,13 +156,13 @@ class MailProcessor:
             return
         logging.info("Successfully selected %s", mailbox_name)
 
-        batch_size = int(os.environ.get("BATCH_SIZE", 50))
         max_wait_seconds = 5
 
         tasks = []
+        batch_size = self.batch_size
         last_proces_time = time.time()
         async for mid, email_item in self.batch_fetch_emails(
-            connection, search_criteria, int(os.environ.get("BATCH_SIZE", 50))
+            connection, search_criteria
         ):
             handler = EmailHandler(mid, email_item, Path(self.base_path) / mailbox_name)
             tasks.append(asyncio.create_task(handler.process_all()))

@@ -8,6 +8,7 @@ dependencies = [
     "aiofiles>=24.1.0",
     "aioimaplib>=2.0.1",
     "click>=8.1.8",
+    "docling==2.8.3",
     "html2text>=2024.2.26",
     "python-dotenv>=1.0.1",
     "tqdm>=4.67.1",
