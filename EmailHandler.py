@@ -39,7 +39,6 @@ class EmailHandler:
 
         folder_path = self.base_path / f"{date}-{self.msg_id}"
         folder_path.mkdir(parents=True, exist_ok=True)
-
         self.folder_path = folder_path
 
     async def save_email_file(self):
@@ -93,7 +92,9 @@ class EmailHandler:
 
         md += "\n" + body_md
 
-        async with aiofiles.open(self.folder_path / "email.md") as f:
+        self.folder_path.mkdir(parents=True, exist_ok=True)
+
+        async with aiofiles.open(self.folder_path / "email.md", "w") as f:
             await f.write(md)
 
     async def process_all(self):

@@ -168,7 +168,6 @@ class MailProcessor:
             tasks.append(asyncio.create_task(handler.process_all()))
 
             current_time = time.time()
-            logging.info(f"{current_time}")
             if len(tasks) >= batch_size or (
                 current_time - last_proces_time >= max_wait_seconds and tasks
             ):
