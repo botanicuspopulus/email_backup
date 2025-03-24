@@ -11,3 +11,5 @@ wheels/
 
 emails/
 email
+
+.env
