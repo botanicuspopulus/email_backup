@@ -1,16 +1,12 @@
 import asyncio
-import itertools
+import asyncio.locks
 import logging
 import os
-import re
-import time
 from pathlib import Path
 
 import aioimaplib
-from aioimaplib import Response
-from tqdm import tqdm
 
-from EmailHandler import EmailHandler
+from MailboxProcessor import MailboxProcessor
 
 
 def extract_mailbox_name(line: bytes) -> str | None:
@@ -30,31 +26,169 @@ def extract_mailbox_name(line: bytes) -> str | None:
 
 
 class MailProcessor:
-    def __init__(self, server: str, username: str, password: str, base_path: Path):
+
+    def __init__(
+        self,
+        server: str,
+        username: str,
+        password: str,
+        search_criteria: str,
+        base_path: Path,
+    ):
         self.server = server
         self.username = username
         self.password = password
+        self.search_criteria = search_criteria.split()
+        self.batch_size = int(os.getenv("BATCH_SIZE", "50"))
+        self.max_connections = int(os.getenv("MAX_CONNECTIONS", "10"))
+        aioimaplib.IMAP4.timeout = 30
+
+        base_path.mkdir(parents=True, exist_ok=True)
         self.base_path = base_path
+
         self.connection = None
         self.mailboxes = None
-        self.batch_size = int(os.environ.get("BATCH_SIZE", 50))
+        self.connection_pool = []
+        self.pool_lock = asyncio.Lock()
 
     async def connect(self):
-        self.connection = aioimaplib.IMAP4_SSL(self.server)
-        await self.connection.wait_hello_from_server()
-        response = await self.connection.login(self.username, self.password)
+        """Connect and login to mail server"""
+        logging.info("Connecting to %s", self.server)
+        try:
+            self.connection = aioimaplib.IMAP4_SSL(self.server)
+            await self.connection.wait_hello_from_server()
 
-        if response.result != "OK":
-            logging.error("Connection to %s Failed", self.server)
-        else:
-            logging.info("Connection to %s was Successful", self.server)
+            response = await self.connection.login(self.username, self.password)
+            if response.result != "OK":
+                logging.error("Connection to %s Failed", self.server)
+            else:
+                logging.info("Connection to %s was Successful", self.server)
+        except ConnectionError as e:
+            logging.error("Failed to create connection to %s: %s", self.server, str(e))
 
     async def disconnect(self):
+        """Logout from the mail server"""
+        disconnect_tasks = []
+
         if self.connection:
-            await self.connection.logout()
-            logging.info("Logged out from IMAP Server %s", self.server)
+            disconnect_tasks.append(
+                asyncio.create_task(
+                    self._safe_logout(self.connection, "main connection")
+                )
+            )
+            self.connection = None
+
+        async with self.pool_lock:
+            for conn in self.connection_pool:
+                disconnect_tasks.append(
+                    asyncio.create_task(self._safe_logout(conn, "pooled connection"))
+                )
+            self.connection_pool = []
+
+        if disconnect_tasks:
+            await asyncio.wait(disconnect_tasks, timeout=15)
+
+        logging.info("Closed all connections to IMAP Server %s", self.server)
+
+    async def _safe_logout(self, connection, conn_type="connection"):
+        try:
+            await asyncio.wait_for(connection.logout(), timeout=10)
+            logging.debug("Successfully closed %s to %s", conn_type, self.server)
+        except Exception as e:
+            logging.warning("Error closing %s to %s: %s", conn_type, self.server, str(e))
+
+    async def get_connection(self):
+        """
+        Get a connection from the connection pool.
+        This checks if the connection is stale. If the connection is stale,
+        it will attempt to logout from the connection
+        If there are no connections in the connection pool, then a new connection
+        will be created.
+        """
+        max_retries = 3
+        retry_delay = 2
+
+        async with self.pool_lock:
+            if self.connection_pool:
+                connection = self.connection_pool.pop()
+                try:
+                    response = await asyncio.wait_for(connection.noop(), timeout=5)
+                    if response.result == "OK":
+                        return connection
+                except Exception as e:
+                    logging.warning(
+                        "Pool connection is stale, creating new one: %s", str(e)
+                    )
+                    try:
+                        await connection.logout()
+                    except Exception:
+                        pass
+
+        for attempt in range(1, max_retries + 1):
+            try:
+                connection = aioimaplib.IMAP4_SSL(self.server)
+                await asyncio.wait_for(connection.wait_hello_from_server(), timeout=10)
+                response = await asyncio.wait_for(
+                    connection.login(self.username, self.password), timeout=15
+                )
+
+                if response.result != "OK":
+                    if attempt < max_retries:
+                        await asyncio.sleep(retry_delay)
+                        retry_delay *= 2
+                        continue
+
+                    raise ConnectionError(
+                        f"Login to {self.server} failed after {max_retries} attempts"
+                    )
+
+                return connection
+            except (asyncio.TimeoutError, ConnectionError, OSError) as e:
+                if attempt < max_retries:
+                    logging.warning(
+                        "Connection attempt %d failed: %s. Retrying in %ds",
+                        attempt,
+                        str(e),
+                        retry_delay,
+                    )
+                    await asyncio.sleep(retry_delay)
+                    retry_delay *= 2
+                else:
+                    logging.error(
+                        "Failed to connect to %s after %s attempts",
+                        self.server,
+                        max_retries,
+                    )
+                    raise
+                raise
+
+    async def release_connection(self, connection):
+        if not connection:
+            return
+
+        try:
+            response = await asyncio.wait_for(connection.noop(), timeout=5)
+            if response.result == "OK":
+                async with self.pool_lock:
+                    if len(self.connection_pool) < self.max_connections:
+                        self.connection_pool.append(connection)
+                        return True
+
+                    await asyncio.wait_for(connection.logout(), timeout=5)
+                    return False
+        except Exception as e:
+            logging.warning("Connection is not reusable: %s", str(e))
+
+        try:
+            await asyncio.wait_for(connection.logout(), timeout=5)
+        except Exception as e:
+            logging.debug("Connection is not reusable: %s", str(e))
+
+        return False
 
     async def retrieve_mailboxes(self):
+        """ "Populate the list of all available mailboxes on the server"""
+        logging.info("Getting mailbox names on %s", self.server)
         if not self.connection:
             logging.error("No connection to mail server %s", self.server)
             return
@@ -69,119 +203,42 @@ class MailProcessor:
         )
         logging.debug("Retrieved %d mailboxes: %s", len(self.mailboxes), self.mailboxes)
 
-    async def process_all_mailboxes(self, search_criteria: str = "ALL"):
+    async def process_all_mailboxes(self):
         if not self.mailboxes:
             logging.error("There are no mailboxes to process for %s", self.server)
             return
-            
-        pbar = tqdm(total=len(self.mailboxes))
-        async def wrapped(mailbox: str):
-            pbar.set_description(f"Processing mailbox {mailbox}")
-            result = await self.process_mailbox(mailbox, search_criteria)
-            pbar.update(1)
-            return result
 
-        mailbox_tasks = [wrapped(mailbox) for mailbox in self.mailboxes]
+        semaphore = asyncio.Semaphore(self.max_connections)
+        failed_mailboxes = []
 
-        if not mailbox_tasks:
-            logging.info("No mail matching %s found", search_criteria)
-            return
-            
-        for task in asyncio.as_completed(mailbox_tasks):
-            try:
-                await task
-            except asyncio.CancelledError:
-                logging.info("Mailbox processing task cancelled")
-                raise
+        async def process_mailbox(mailbox_name):
+            async with semaphore:
+                connection = None
 
-            pbar.update(1)
-        pbar.close()
+                try:
+                    connection = await self.get_connection()
 
-    async def batch_fetch_emails(
-        self, connection, search_criteria: str = "ALL"):
-        criteria_args = search_criteria.split()
-        response = await connection.search(*criteria_args)
-        if response.result != "OK":
-            logging.error("Search of batched email fetch failed: %s", response.result)
-            return
+                    handler = MailboxProcessor(
+                        connection, mailbox_name, self.search_criteria, self.base_path
+                    )
+                    await handler.process()
 
-        if len(response.lines) < 2:
-            logging.info("No search results for current mailbox")
-            return
+                    if not await self.release_connection(connection):
+                        connection = None
+                except asyncio.TimeoutError:
+                    logging.error(
+                        "Timeout processing mailbox %s - will retry later", mailbox_name
+                    )
+                    failed_mailboxes.append(mailbox_name)
+                except Exception as e:
+                    logging.error(
+                        "Error processing mailbox %s: %s", mailbox_name, str(e)
+                    )
+                    failed_mailboxes.append(mailbox_name)
 
-        message_numbers = response.lines[0]
+        mailbox_tasks = [
+            process_mailbox(mailbox_name) for mailbox_name in self.mailboxes
+        ]
+        await asyncio.gather(*mailbox_tasks)
 
-        msg_ids = message_numbers.split()
-        batch_size = self.batch_size
-        for i in tqdm(
-            range(0, len(msg_ids), batch_size), desc="Fetching batch of emails"
-        ):
-            batch = msg_ids[i : i + batch_size]
-            id_string = ",".join(mid.decode("utf-8") for mid in batch)
-            response = await connection.fetch(id_string, "(BODY[])")
-            if response.result != "OK":
-                logging.error("Fetch failed for batch %s", id_string)
-                continue
-
-            for items in itertools.batched(response.lines[:-2], n=3):
-                mid = items[0].decode().split()[0]
-                raw_email = items[1]
-                yield mid, raw_email
-
-    async def _process_email_tasks(self, tasks: list[asyncio.Task], mailbox_name: str):
-        if not tasks:
-            return
-
-        pbar = tqdm(total=len(tasks), desc=f"Processing emails in {mailbox_name}")
-        for task in asyncio.as_completed(tasks):
-            try:
-                await task
-            except asyncio.CancelledError:
-                logging.info("Email processing task cancelled for %s", mailbox_name)
-                raise
-
-            pbar.update(1)
-        pbar.close()
-
-    async def process_mailbox(
-        self, mailbox_name: str = "INBOX", search_criteria: str = "ALL"
-    ):
-        connection = aioimaplib.IMAP4_SSL(self.server)
-        await connection.wait_hello_from_server()
-
-        response = await connection.login(self.username, self.password)
-        if response.result != "OK":
-            logging.error("Login failed for %s", mailbox_name)
-            return
-        logging.info("Successfully connected to %s for %s", self.server, mailbox_name)
-
-        response = await connection.select(f'"{mailbox_name}"')
-        if response.result != "OK":
-            logging.error("Cannot select mailbox folder: %s", mailbox_name)
-            await connection.logout()
-            return
-        logging.info("Successfully selected %s", mailbox_name)
-
-        max_wait_seconds = 5
-
-        tasks = []
-        batch_size = self.batch_size
-        last_proces_time = time.time()
-        async for mid, email_item in self.batch_fetch_emails(
-            connection, search_criteria
-        ):
-            handler = EmailHandler(mid, email_item, Path(self.base_path) / mailbox_name)
-            tasks.append(asyncio.create_task(handler.process_all()))
-
-            current_time = time.time()
-            if len(tasks) >= batch_size or (
-                current_time - last_proces_time >= max_wait_seconds and tasks
-            ):
-                await self._process_email_tasks(tasks, mailbox_name)
-                tasks = []
-                last_proces_time = current_time
-
-        if tasks:
-            await self._process_email_tasks(tasks, mailbox_name)
-
-        await connection.logout()
+        return failed_mailboxes

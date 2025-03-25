@@ -1,20 +1,21 @@
 import asyncio
-import re
 import email
+import itertools
 import logging
-from pathlib import Path
+import re
+from datetime import datetime
 from email import policy
 from email.header import decode_header
 from functools import lru_cache
+from pathlib import Path
 
 import aiofiles
 import html2text
 
-from docling.document_converter import DocumentConverter
-from docling.datamodel.base_models import InputFormat
 
 def sanitize_filename(filename: str) -> str:
     return re.sub(r'[\\/*?:"<>|]', "_", filename)
+
 
 @lru_cache(maxsize=1024)
 def decode_header_value(header_value) -> str:
@@ -29,19 +30,24 @@ def decode_header_value(header_value) -> str:
         for part, encoding in decoded_parts
     )
 
+
 class EmailHandler:
-    def __init__(self, msg_id: str, raw_email: bytes, base_path: Path):
+
+    def __init__(
+        self, msg_id: str, mailbox_name: str, raw_email: bytes, base_path: Path
+    ):
         self.msg_id = msg_id
+        self.base_path = base_path
+        self.mailbox_name = sanitize_filename(mailbox_name)
+
         self.raw_email = raw_email
         self.msg = email.message_from_bytes(raw_email, policy=policy.default)
-        self.base_path = base_path
 
         date = self.msg.get("Date", "no_date")
         if date != "no_date":
             try:
                 date = email.utils.parsedate_to_datetime(date).strftime("%Y-%m-%d")
             except ValueError:
-                from datetime import datetime
                 try:
                     date = datetime.strptime(date, "%d-%m-%Y %H:%M:%S").strftime(
                         "%Y-%m-%d"
@@ -49,64 +55,90 @@ class EmailHandler:
                 except ValueError:
                     date = "no_date"
 
-        folder_path = self.base_path / f"{date}-{self.msg_id}"
+        folder_path = base_path / self.mailbox_name / f"{date}-{msg_id}"
         folder_path.mkdir(parents=True, exist_ok=True)
         self.folder_path = folder_path
 
+    async def mark_email_as_processed(self):
+        """Marks the email that has been processed by recording it in the .tracking folder"""
+        tracking_dir = self.base_path / ".tracking"
+        tracking_dir.mkdir(parents=True, exist_ok=True)
+
+        tracking_file = tracking_dir / f"{self.mailbox_name}_processed_emails.txt"
+        async with aiofiles.open(tracking_file, "a") as f:
+            await f.write(f"{self.msg_id}\n")
+
     async def save_email_file(self):
+        """
+        Save the raw email bytes as an .eml file if any additional information
+        needs to be processed later
+        """
         email_file_path = self.folder_path / "email.eml"
+
+        if email_file_path.exists():
+            logging.debug("File already exists: %s", email_file_path)
+            return
+
         async with aiofiles.open(email_file_path, "wb") as f:
             await f.write(self.raw_email)
 
-    async def process_pdf(self, filepath: Path, data: bytes):
-        await self._async_write_file(filepath, data)
-        converter = DocumentConverter(allowed_formats=[
-            InputFormat.PDF
-        ])
-        
-        try:
-            result = await asyncio.to_thread(converter.convert, filepath)
-            async with aiofiles.open(filepath.with_suffix(".md"), "w") as f:
-                await f.write(result.document.export_to_markdown())
-        except Exception as e:
-            logging.error("Error performing OCR on PDF %s: %s", filepath, e)
-            
     async def save_attachments(self):
-        tasks = []
+        """
+        Iterates over the attachments of the email and saves them in the same directory
+        as the email
+        """
+
+        async def write_file_chunked(filepath: Path, part):
+            payload = part.get_payload(decode=True)
+            if not payload:
+                return True
+
+            buffer_size = 32 * 1024
+
+            try:
+                async with aiofiles.open(filepath, "wb") as f:
+                    for i in range(0, len(payload), buffer_size):
+                        chunk = payload[i:i + buffer_size]
+                        await f.write(chunk)
+
+                return True
+            except OSError as e:
+                logging.error("Failed to save attachment %s: %s", filepath, str(e))
+                return False
+
+        attachment_tasks = set()
         for part in self.msg.iter_attachments():
             attachment_filename = part.get_filename()
             if not attachment_filename:
                 continue
 
-            attachment_path = self.folder_path / sanitize_filename(
-                attachment_filename
-            )
+            attachment_path = self.folder_path / sanitize_filename(attachment_filename)
             if attachment_path.exists():
                 continue
 
-            payload = part.get_payload(decode=True)
-            if not payload:
-                continue
-
-            if attachment_path.suffix == ".pdf":
-                tasks.append(asyncio.create_task(
-                    self.process_pdf(attachment_path, payload))
-                )
-            else:
-                tasks.append(
-                    asyncio.create_task(
-                        self._async_write_file(attachment_path, payload)
-                    )
+            if len(attachment_tasks) >= 5:
+                done, attachment_tasks = await asyncio.wait(
+                    attachment_tasks, return_when=asyncio.FIRST_COMPLETED
                 )
 
-        if tasks:
-            await asyncio.gather(*tasks)
+            attachment_tasks.add(
+                asyncio.create_task(write_file_chunked(attachment_path, part))
+            )
 
-    async def _async_write_file(self, file_path: Path, data: bytes):
-        async with aiofiles.open(file_path, "wb") as f:
-            await f.write(data)
+        await asyncio.gather(*attachment_tasks, return_exceptions=True)
 
     async def save_markdown(self):
+        """Saves the email in the form of a markdown and includes some of the header fields and the body of the email"""
+        filepath = self.folder_path / "email.md"
+
+        if filepath.exists():
+            logging.debug("File already exists: %s", filepath)
+            return
+
+        converter = html2text.HTML2Text()
+        converter.ignore_links = False
+        converter.body_width = 0
+
         metadata_fields = ("From", "To", "CC", "BCC", "Subject", "Date")
         md = "| Field | Value |\n| --- | --- |\n"
         for field in metadata_fields:
@@ -114,25 +146,29 @@ class EmailHandler:
             md += f"| {field} | {value} |\n"
 
         body = self.msg.get_body(preferencelist=("plain", "html"))
+        body_md = ""
+
         if body:
             content = body.get_content()
             if body.get_content_type() == "text/html":
-                converter = html2text.HTML2Text()
-                converter.ignore_links = False
-                body_md = converter.handle(content)
+                body_md = await asyncio.get_event_loop().run_in_executor(
+                    None, converter.handle, content
+                )
             else:
                 body_md = content
-        else:
-            body_md = ""
 
         md += "\n" + body_md
 
-        self.folder_path.mkdir(parents=True, exist_ok=True)
-
-        async with aiofiles.open(self.folder_path / "email.md", "w") as f:
+        async with aiofiles.open(filepath, "w") as f:
             await f.write(md)
 
-    async def process_all(self):
-        await asyncio.gather(
-            self.save_email_file(), self.save_attachments(), self.save_markdown()
-        )
+    async def save_all(self):
+        tasks = [
+            self.save_email_file(),
+            self.save_markdown(),
+            self.save_attachments() if any(self.msg.iter_attachments()) else None
+        ]
+
+        await asyncio.gather(*[t for t in tasks if t is not None])
+
+        await self.mark_email_as_processed()
